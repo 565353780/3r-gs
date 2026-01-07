@@ -20,6 +20,9 @@ from .normalize import (
 )
 import evo.core.geometry as geometry
 
+# 导入通用数据接口
+from .pose_data_interface import PoseEstimationData, CorrespondenceData, load_from_mast3r_directory
+
 def _get_rel_paths(path_dir: str) -> List[str]:
     """Recursively get relative paths of files in a directory."""
     paths = []
@@ -30,7 +33,12 @@ def _get_rel_paths(path_dir: str) -> List[str]:
 
 
 class Parser:
-    """DUSR3R parser."""
+    """通用解析器,支持从文件或直接传入数据初始化。
+    
+    可以通过两种方式使用:
+    1. 传统方式: 只传入data_dir,从MASt3R输出目录读取
+    2. 新方式: 传入pose_data参数,使用任意位姿估计模块的输出
+    """
 
     def __init__(
         self,
@@ -39,7 +47,19 @@ class Parser:
         normalize: bool = False,
         test_every: int = 8,
         image_fn_ext = 'jpg',
+        pose_data: Optional[PoseEstimationData] = None,
     ):
+        """
+        初始化解析器
+        
+        Args:
+            data_dir: 数据目录,包含images/目录和split文件
+            factor: 图像下采样因子
+            normalize: 是否归一化世界空间
+            test_every: 每隔多少张图像取一张测试图像
+            image_fn_ext: 图像文件扩展名
+            pose_data: PoseEstimationData对象,如果提供则使用这个数据而不是从文件读取
+        """
         #colmap_image_dir = os.path.join(data_dir, "images"+f"_{factor}")
         colmap_image_dir = os.path.join(data_dir, "images")
         colmap_images = sorted(os.listdir(colmap_image_dir))
@@ -50,21 +70,29 @@ class Parser:
         self.normalize = normalize
         self.test_every = test_every
 
-        dust_dir = os.path.join(data_dir, "mast3r/0/")
-        if not os.path.exists(dust_dir):
-            dust_dir = os.path.join(data_dir, "mast3r")
-        assert os.path.exists(
-            dust_dir
-        ), f"mast3r directory {dust_dir} does not exist."
-        self.dust_dir = dust_dir
-
         with open(os.path.join(data_dir, 'images_train.txt'), 'r') as file:
             self.train_split = [line.strip() for line in file]
         with open(os.path.join(data_dir, 'images_test.txt'), 'r') as file:
             self.test_split = [line.strip() for line in file]
 
-        intrinsics_train = np.load(os.path.join(dust_dir, 'camera_intrinsics.npy'))
-        camtoworlds_train = np.load(os.path.join(dust_dir, 'camera_poses.npy'))
+        # 如果提供了pose_data,直接使用;否则从MASt3R目录加载
+        if pose_data is not None:
+            print("使用提供的PoseEstimationData初始化...")
+            intrinsics_train = pose_data.camera_intrinsics
+            camtoworlds_train = pose_data.camera_poses
+            self.dust_dir = None  # 标记为使用外部数据
+        else:
+            print("从MASt3R目录加载数据...")
+            dust_dir = os.path.join(data_dir, "mast3r/0/")
+            if not os.path.exists(dust_dir):
+                dust_dir = os.path.join(data_dir, "mast3r")
+            assert os.path.exists(
+                dust_dir
+            ), f"mast3r directory {dust_dir} does not exist."
+            self.dust_dir = dust_dir
+            
+            intrinsics_train = np.load(os.path.join(dust_dir, 'camera_intrinsics.npy'))
+            camtoworlds_train = np.load(os.path.join(dust_dir, 'camera_poses.npy'))
 
         camtoworlds_train_gt = np.load(os.path.join(data_dir, 'pose_gt_train.npy'))
         camtoworlds_test_gt = np.load(os.path.join(data_dir, 'pose_gt_test.npy'))
@@ -96,9 +124,19 @@ class Parser:
         camtoworlds_gt = camtoworlds_gt[inds]
         self.intrinsics = intrinsics
 
-        ply_data = PlyData.read(os.path.join(dust_dir, 'pointcloud.ply'))
-        point_cloud = ply_data['vertex']
-        points = np.stack([point_cloud['x'], point_cloud['y'], point_cloud['z']], axis=-1)
+        # 加载点云数据
+        if pose_data is not None:
+            # 使用提供的点云数据
+            points = pose_data.point_cloud
+            points_rgb = pose_data.point_cloud_rgb
+            points_err = pose_data.point_cloud_errors
+        else:
+            # 从PLY文件加载
+            ply_data = PlyData.read(os.path.join(dust_dir, 'pointcloud.ply'))
+            point_cloud = ply_data['vertex']
+            points = np.stack([point_cloud['x'], point_cloud['y'], point_cloud['z']], axis=-1)
+            points_rgb = np.stack([point_cloud['red'], point_cloud['green'], point_cloud['blue']], axis=-1)
+            points_err = np.zeros(len(points))
 
         self.image_names = filelist  # List[str], (num_images,)
         if factor > 1:
@@ -184,8 +222,8 @@ class Parser:
                             zip(self.camera_ids, self.image_paths)}  # Dict of camera_id -> (width, height)
         self.mask_dict = {cam_id: None for cam_id in self.camera_ids}  # Dict of camera_id -> mask
         self.points = points
-        self.points_err = np.zeros_like(self.points)  # np.ndarray, (num_points,)
-        self.points_rgb = np.stack([point_cloud['red'], point_cloud['green'], point_cloud['blue']], axis=-1)  # np.ndarray, (num_points, 3)
+        self.points_err = points_err  # np.ndarray, (num_points,)
+        self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
 
 
         num_sampled = 150000
@@ -339,7 +377,14 @@ class Dataset:
 class CorrespondenceDataset():
     """Dataset class for loading correspondence data between image pairs."""
     
-    def __init__(self, parser: Parser, split: str = "train", patch_size: Optional[int] = None, load_depths: bool = False):
+    def __init__(
+        self, 
+        parser: Parser, 
+        split: str = "train", 
+        patch_size: Optional[int] = None, 
+        load_depths: bool = False,
+        corr_data: Optional[CorrespondenceData] = None,
+    ):
         """Initialize the dataset.
         
         Args:
@@ -347,21 +392,36 @@ class CorrespondenceDataset():
             split (str): Dataset split ("train" or "test")
             patch_size (Optional[int]): Size of random patches to extract
             load_depths (bool): Whether to load depth information
+            corr_data (Optional[CorrespondenceData]): 对应关系数据,如果提供则使用这个而不是从文件读取
         """
         # Initialize base dataset
         self.dataset = Dataset(parser, split, patch_size, load_depths)
         
-        data_dir = parser.dust_dir
-        
-        # Load correspondence tensors from numpy arrays
-        self.corr_i = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_i.npy')))
-        self.corr_j = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_j.npy')))
-        self.corr_batch_idx = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_batch_idx.npy')))
-        self.corr_mask = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_mask.npy')))
-        self.corr_weight = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_weight.npy')))
-        self.ei = torch.from_numpy(np.load(os.path.join(data_dir, 'ei.npy')))
-        self.ej = torch.from_numpy(np.load(os.path.join(data_dir, 'ej.npy')))
-        self.depthmaps = torch.from_numpy(np.load(os.path.join(data_dir, 'depthmaps.npy')))
+        # 如果提供了corr_data,直接使用;否则从文件加载
+        if corr_data is not None:
+            print("使用提供的CorrespondenceData初始化...")
+            self.corr_i = torch.from_numpy(corr_data.corr_i)
+            self.corr_j = torch.from_numpy(corr_data.corr_j)
+            self.corr_batch_idx = torch.from_numpy(corr_data.corr_batch_idx)
+            self.corr_mask = torch.from_numpy(corr_data.corr_mask)
+            self.corr_weight = torch.from_numpy(corr_data.corr_weight)
+            self.ei = torch.from_numpy(corr_data.ei)
+            self.ej = torch.from_numpy(corr_data.ej)
+            self.depthmaps = torch.from_numpy(corr_data.depthmaps) if corr_data.depthmaps is not None else torch.zeros(len(self.dataset), *self.dataset.image_size[::-1])
+        else:
+            data_dir = parser.dust_dir
+            assert data_dir is not None, "如果不提供corr_data,必须从MASt3R目录加载"
+            
+            print("从MASt3R目录加载对应关系数据...")
+            # Load correspondence tensors from numpy arrays
+            self.corr_i = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_i.npy')))
+            self.corr_j = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_j.npy')))
+            self.corr_batch_idx = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_batch_idx.npy')))
+            self.corr_mask = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_mask.npy')))
+            self.corr_weight = torch.from_numpy(np.load(os.path.join(data_dir, 'corr_weight.npy')))
+            self.ei = torch.from_numpy(np.load(os.path.join(data_dir, 'ei.npy')))
+            self.ej = torch.from_numpy(np.load(os.path.join(data_dir, 'ej.npy')))
+            self.depthmaps = torch.from_numpy(np.load(os.path.join(data_dir, 'depthmaps.npy')))
         # Resize depthmaps to match dataset image size
         self.depthmaps = F.interpolate(
             self.depthmaps.unsqueeze(1), # Add channel dimension

@@ -19,6 +19,7 @@ import yaml
 import kornia
 #from datasets.colmap import Dataset, Parser
 from datasets.mast3r import Dataset, Parser, CorrespondenceDataset, align_pose
+from datasets.pose_data_interface import PoseEstimationData, CorrespondenceData, load_from_mast3r_directory
 from datasets.traj import (
     generate_interpolated_path,
     generate_ellipse_path_z,
